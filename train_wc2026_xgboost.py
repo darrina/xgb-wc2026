@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 
+UNKNOWN_STADIUM = "unknown"
+
 
 FEATURE_ALIASES = {
     "goals": ["goals", "goal"],
@@ -27,7 +29,7 @@ FEATURE_ALIASES = {
     ],
     "blocked_goals": ["blocked_goals", "blocked_goal", "blocks"],
     "corner_kicks": ["corner_kicks", "corners", "corner"],
-    "overtime": ["overtime", "overage_time", "stoppage_time", "extra_time"],
+    "overtime": ["overtime", "stoppage_time", "added_time", "injury_time"],
     "stadium": ["stadium", "venue"],
     "attendance": ["attendance", "crowd"],
     "temperature": ["temperature", "temp", "weather_temperature"],
@@ -39,7 +41,10 @@ TEAM_ALIASES = ["team", "team_name", "country"]
 
 
 def normalize_name(name: str) -> str:
-    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", name.strip().lower())).strip("_")
+    normalized = name.strip().lower()
+    normalized = re.sub(r"[^a-z0-9]+", "_", normalized)
+    normalized = re.sub(r"_+", "_", normalized)
+    return normalized.strip("_")
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -64,7 +69,7 @@ def find_feature_columns(df: pd.DataFrame) -> dict[str, str]:
     return feature_cols
 
 
-def parse_percent(value):
+def parse_percent(value) -> float:
     if pd.isna(value):
         return np.nan
     if isinstance(value, str):
@@ -92,9 +97,13 @@ def build_features(df: pd.DataFrame, feature_map: dict[str, str]) -> pd.DataFram
             "temperature": to_numeric_series(df[feature_map["temperature"]]),
         }
     )
-    stadium = pd.get_dummies(df[feature_map["stadium"]].fillna("unknown").astype(str), prefix="stadium")
+    stadium = pd.get_dummies(
+        df[feature_map["stadium"]].fillna(UNKNOWN_STADIUM).astype(str), prefix="stadium"
+    )
     merged = pd.concat([numeric, stadium], axis=1)
-    return merged.fillna(merged.median(numeric_only=True)).fillna(0)
+    median_fill_values = numeric.median()
+    merged[numeric.columns] = merged[numeric.columns].fillna(median_fill_values)
+    return merged.fillna(0)
 
 
 def parse_label(series: pd.Series) -> pd.Series:
@@ -114,18 +123,18 @@ def parse_label(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
-def train_model(x: pd.DataFrame, y: pd.Series) -> XGBClassifier:
+def train_model(features: pd.DataFrame, labels: pd.Series, params: argparse.Namespace) -> XGBClassifier:
     model = XGBClassifier(
         objective="binary:logistic",
         eval_metric="logloss",
-        n_estimators=350,
-        learning_rate=0.05,
-        max_depth=4,
-        subsample=0.9,
-        colsample_bytree=0.9,
+        n_estimators=params.n_estimators,
+        learning_rate=params.learning_rate,
+        max_depth=params.max_depth,
+        subsample=params.subsample,
+        colsample_bytree=params.colsample_bytree,
         random_state=42,
     )
-    model.fit(x, y)
+    model.fit(features, labels)
     return model
 
 
@@ -145,6 +154,12 @@ def main():
     parser.add_argument("--upcoming-csv", required=True, help="CSV with upcoming 2026 match/team stats.")
     parser.add_argument("--output-csv", default="predicted_winners_2026.csv", help="Output CSV for predictions.")
     parser.add_argument("--model-json", default="xgb_wc2026_model.json", help="Path to save trained model JSON.")
+    parser.add_argument("--n-estimators", type=int, default=350, help="XGBoost n_estimators.")
+    parser.add_argument("--learning-rate", type=float, default=0.05, help="XGBoost learning_rate.")
+    parser.add_argument("--max-depth", type=int, default=4, help="XGBoost max_depth.")
+    parser.add_argument("--subsample", type=float, default=0.9, help="XGBoost subsample.")
+    parser.add_argument("--colsample-bytree", type=float, default=0.9, help="XGBoost colsample_bytree.")
+    parser.add_argument("--winner-threshold", type=float, default=0.5, help="Threshold for winner/loser label.")
     args = parser.parse_args()
 
     train_df = normalize_columns(pd.read_csv(args.train_csv))
@@ -154,14 +169,23 @@ def main():
     feature_map = find_feature_columns(train_df)
 
     x_train = build_features(train_df, feature_map)
-    y_train = parse_label(train_df[label_col]).dropna()
-    x_train = x_train.loc[y_train.index]
+    parsed_labels = parse_label(train_df[label_col])
+    valid_label_mask = parsed_labels.notna()
+    dropped = int((~valid_label_mask).sum())
+    if dropped:
+        print(f"Warning: dropped {dropped} training row(s) with missing/invalid win-lose label.")
+
+    y_train = parsed_labels[valid_label_mask]
+    x_train = x_train.loc[valid_label_mask]
     y_train = y_train.astype(int)
 
     if y_train.nunique() < 2:
-        raise ValueError("Training label has fewer than 2 classes after parsing win/lose values.")
+        raise ValueError(
+            f"Training label has fewer than 2 classes after parsing win/lose values. "
+            f"Found {y_train.nunique()} unique class(es): {sorted(y_train.unique().tolist())}"
+        )
 
-    model = train_model(x_train, y_train)
+    model = train_model(x_train, y_train, args)
     model.save_model(args.model_json)
 
     upcoming_feature_map = find_feature_columns(upcoming_df)
@@ -176,14 +200,23 @@ def main():
     team_col = pick_column(results, TEAM_ALIASES, required=False)
 
     if match_col:
-        winner_rows = results.loc[results.groupby(match_col)["win_probability"].idxmax()].copy()
-        winner_rows["predicted_result"] = "winner"
+        max_prob_by_match = results.groupby(match_col)["win_probability"].transform("max")
+        winner_mask = np.isclose(results["win_probability"], max_prob_by_match, rtol=0.0, atol=1e-12)
+        winner_mask = winner_mask & (results["win_probability"] >= args.winner_threshold)
+        winner_rows = results[winner_mask].copy()
+        winner_counts = winner_rows.groupby(match_col)["win_probability"].transform("count")
+        winner_rows["predicted_result"] = np.where(winner_counts > 1, "winner_tie", "winner")
     else:
         winner_rows = results.sort_values("win_probability", ascending=False).copy()
-        winner_rows["predicted_result"] = np.where(winner_rows["win_probability"] >= 0.5, "winner", "loser")
+        winner_rows["predicted_result"] = np.where(
+            winner_rows["win_probability"] >= args.winner_threshold, "winner", "loser"
+        )
+        winner_rows = winner_rows[winner_rows["predicted_result"] == "winner"].copy()
 
     preferred_columns = [c for c in [match_col, team_col, "win_probability", "predicted_result"] if c]
-    winner_rows = winner_rows[preferred_columns + [c for c in winner_rows.columns if c not in preferred_columns]]
+    preferred_set = set(preferred_columns)
+    other_columns = [c for c in winner_rows.columns if c not in preferred_set]
+    winner_rows = winner_rows[preferred_columns + other_columns]
 
     output_path = Path(args.output_csv)
     winner_rows.to_csv(output_path, index=False)
